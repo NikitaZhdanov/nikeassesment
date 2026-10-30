@@ -27,7 +27,7 @@ flowchart LR
   Migration[golang-migrate job] --> DB
 ```
 
-Go 1.26 or newer; builds use Go 1.26.8. PostgreSQL 17 is the supported database version. Docker Compose v2 runs local and acceptance environments.
+Go 1.26 or newer; builds use Go 1.26.10. PostgreSQL 17 is the supported database version. Docker Compose v2 runs local and acceptance environments.
 
 * `github.com/go-chi/chi/v5`: routing, request IDs, recovery middleware, HTTP compatibility. See [chi](https://github.com/go-chi/chi).
 * `github.com/go-playground/validator/v10`: declarative field validation; small explicit checks cover domain patterns and price presence. See [validator](https://github.com/go-playground/validator).
@@ -97,3 +97,13 @@ Integration tests run only with the `integration` build tag and a required TEST_
 E2E tests run only with the `e2e` tag and required E2E_BASE_URL. Compose builds the actual binary, waits for PostgreSQL health and migration completion, then runs black-box HTTP scenarios UC-01–UC-07. The runner stops PostgreSQL for outage checks, restarts it, and verifies recovery/durability. A shell trap preserves failing exit status and cleans the isolated test project, including test volumes. CI runs unit coverage/vet, persistence integration, and E2E.
 
 A separate SQL experiment seeds 300,000 rows using generate_series, ANALYZEs the table, and prints EXPLAIN (ANALYZE, BUFFERS) for first/deep pages and category/range browsing. Use a disposable database. This verifies query behavior on representative data; it is not an unmeasured throughput or availability claim.
+
+## CI static and security checks
+
+Keep four independent GitHub Actions jobs: `unit` for coverage/race tests, `static` for formatting/vet/Staticcheck, `security` for dependency integrity and vulnerability scanning, and `system` for Compose integration/E2E. All run on pushes, pull requests, weekly schedules, and manual dispatch. Jobs have timeouts and read-only repository permissions. `make check` aggregates the local static, coverage, and security commands; system tests remain explicit because they require Docker.
+
+Use only two additional Go-native command-line tools: Staticcheck v0.7.0 (supports the project's Go 1.26 toolchain) and govulncheck v1.9.0. Invoke them with versioned `go run package@version` commands in the Makefile, keeping tool dependencies outside the application's go.mod/go.sum. Downloads/builds use Go's existing caches. Avoid a multi-linter framework or an external coverage service for this small codebase. Staticcheck and vet analyze `integration,e2e` build tags; govulncheck uses the same tags plus `-test` to include test libraries without running database/HTTP tests.
+
+`go mod verify` detects altered downloaded dependencies. govulncheck consults the Go vulnerability database and fails in its normal text-output mode when it finds a reachable known vulnerability; scanner errors also fail CI. Its [documented limitations](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) include conservative interface-call analysis and incomplete reflection visibility. Findings for modules without a reachable vulnerable symbol are informational. This checks Go dependencies and the selected Go standard library; Docker OS packages and leaked secrets are outside these scanners' coverage.
+
+Dependabot uses weekly grouped update proposals for Go modules, GitHub Actions, Docker base images, and Compose service images, without additional installed tooling. [Dependabot configuration](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference) lives in `.github/dependabot.yml`. Tool versions in the Makefile are deliberately pinned and require an explicit edit to upgrade. Branch protection must be configured in repository settings if checks should prevent merging; adding a workflow alone does not enable that setting.

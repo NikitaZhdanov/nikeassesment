@@ -13,7 +13,7 @@ The project follows spec-driven development:
 
 | Tool | Required version | When needed |
 | --- | --- | --- |
-| Go | 1.26+; pinned toolchain/build version 1.26.8 | Local builds and unit tests; the Go launcher can download the pinned toolchain |
+| Go | 1.26+; pinned toolchain/build version 1.26.10 | Local builds and unit tests; the Go launcher can download the pinned toolchain |
 | Docker Engine / Docker Desktop | Engine 20.10+ with a running daemon | Container startup and system tests |
 | Docker Compose | v2.6+ (`docker compose`) | Local stack and integration/E2E orchestration |
 | PostgreSQL | 17; Compose pins 17.6 | Local database if running without Compose; Compose supplies it otherwise |
@@ -126,7 +126,10 @@ Every response includes `X-Request-ID`. Exact field lengths, price bounds, and c
 ## Tests and coverage
 
 ```sh
-make check         # go vet + unit tests with race detector + >=90% coverage gate
+make check         # static checks + >=90% unit coverage/race gate + security scan
+make static        # gofmt, go vet, and pinned Staticcheck (including tagged tests)
+make security      # module integrity + pinned govulncheck (including test libraries)
+make coverage      # unit tests/race detector and the >=90% statement coverage gate
 make test          # unit tests with race detector, without coverage report
 make integration   # migrated real PostgreSQL; repository/constraint tests
 make e2e           # real API + PostgreSQL; UC-01 through UC-07 over HTTP
@@ -155,7 +158,22 @@ E2E_BASE_URL=http://localhost:8080 \
 
 The second command runs the normal acceptance phase; the full outage/recovery sequence requires `make e2e`. Tagged suites require explicit URLs instead of silently skipping when configuration is missing. Use only disposable environments: tests create and delete fixtures and exercise schema rollback inside transactions.
 
-GitHub Actions runs `make check` and `make test-system`. [The task record](docs/tasks.md#verification-record) distinguishes executed checks from pending ones.
+## GitHub checks and dependency security
+
+GitHub Actions publishes four checks on every push and pull request, as well as weekly and manual runs:
+
+| Check | Command | Enforces |
+| --- | --- | --- |
+| Unit tests and coverage | `make coverage` | Unit tests, race detection, and >=90% statement coverage; uploads coverage.out for 14 days |
+| Static analysis | `make static` | gofmt, go vet, and Staticcheck across application and integration/E2E test code |
+| Go dependency security | `make security` | Module-cache integrity and known reachable vulnerabilities in application/test dependencies and the Go standard library |
+| PostgreSQL integration and E2E | `make test-system` | Real database behavior and all HTTP acceptance scenarios, including outage/recovery |
+
+Staticcheck v0.7.0 and govulncheck v1.9.0 are pinned standalone development tools, fetched through Go's module cache. They add no application runtime dependencies and require no external service account. The Makefile runs them with the same Go 1.26.10 toolchain as the API so the standard-library vulnerability scan matches the build. The first run downloads the tools; vulnerability checks also need access to the Go vulnerability database.
+
+govulncheck runs in text mode so reachable vulnerability findings and scanner failures fail the check. Unreachable module findings are informational; the scanner does not cover Docker OS packages or secrets. See [govulncheck's scope and limitations](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck). `go mod verify` checks cached dependencies against their recorded hashes.
+
+Dependabot is configured to propose weekly grouped updates for Go modules, GitHub Actions, Docker base images, and Compose service images. Tool versions pinned in the Makefile are updated explicitly. To require checks before merging, select the four named checks in the repository's branch-protection/ruleset settings. [The task record](docs/tasks.md#verification-record) distinguishes local verification from remote GitHub runs.
 
 ## Query-plan experiment
 

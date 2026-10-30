@@ -73,3 +73,15 @@ Actor: service operator.
 4. Restart PostgreSQL and wait for readiness; a previously created product remains readable.
 
 The Compose orchestration performs the outage/recovery phase after normal acceptance tests. Covers FR-09, NFR-01, NFR-07.
+
+## Developer acceptance — CI quality and security checks
+
+Actor: contributor. These are delivery checks for NFR-09, verified through the same Make commands used in GitHub Actions, rather than HTTP scenarios.
+
+1. Push a commit or open a pull request: unit coverage, static analysis, security, and system tests appear as separate checks.
+2. `make static` rejects unformatted Go code, vet diagnostics, and Staticcheck findings, including code behind integration/E2E build tags.
+3. `make security` verifies the module cache and scans the application and tests with govulncheck. Reachable known vulnerabilities or scan failures return a nonzero exit status.
+4. `make check` runs static checks, the existing >=90% unit coverage gate with race detection, and security checks locally.
+5. Weekly/manual workflow runs detect newly published advisories without requiring source changes. Weekly Dependabot configuration covers Go modules, Actions, and Docker base images.
+
+These checks provide results; requiring them for merges is a repository branch-protection setting.

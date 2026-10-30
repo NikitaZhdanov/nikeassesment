@@ -15,6 +15,7 @@ Execute in order. A task is complete only when its artifacts and specified check
 | 9 | Done | Add isolated Compose integration/E2E environments | NFR-05–06, UC-01–07 | Successful real-database and black-box runs, outage/recovery |
 | 10 | Done | Write README and query-plan experiment | NFR-02, NFR-08 | Reproducible commands, supported versions, observed results |
 | 11 | Done | Review specs against behavior and report verification | All | Final test results and limitations below |
+| 12 | Done | Add separate CI static/security jobs, pinned Go-native scanners, weekly checks and dependency updates | NFR-09 | make static, make security, make check; workflow and Dependabot validation |
 
 ## Verification record
 
@@ -46,3 +47,20 @@ One local Docker Desktop run on 300,000 synthetic products (100 categories, vari
 | OFFSET 270000 comparison | products_price_id_idx | 270,021 | 193.069 ms |
 
 All fixtures were rolled back and the benchmark database was removed. The meaningful observation is bounded index work for cursor queries versus scanning skipped rows for OFFSET; cache state, distribution, row size, hardware and concurrent load affect timings.
+
+### CI and security follow-up
+
+Added independent GitHub checks for coverage, static analysis, security, and system tests; weekly/manual triggers; and grouped Dependabot updates for Go, Actions, Docker, and Compose. Staticcheck v0.7.0 and govulncheck v1.9.0 remain development-only commands. The README documents the gates and how to require them through repository branch protection.
+
+The initial security scan failed as intended on known advisories in chi, pgx, x/net and x/text. Scanning with the exact application toolchain also detected affected Go standard-library symbols. Updated the build, local toolchain, CI, and scanner to Go 1.26.10, and upgraded affected dependencies (including compatible x/crypto/x/net/x/text transitive updates). No scanner findings were suppressed.
+
+| Follow-up check | Result |
+| --- | --- |
+| `make check` with Go 1.26.10 | Passed: formatting, tagged vet/Staticcheck, race tests, 95.42% unit coverage, module integrity, and tagged/test-inclusive govulncheck |
+| Security gate failure behavior | Verified: initial vulnerability findings caused a nonzero Make exit status |
+| Workflow / Dependabot YAML | Parsed successfully; jobs use read-only permissions and bounded timeouts |
+| Final `sh scripts/test-compose.sh all` | Passed with Go 1.26.10 and updated dependencies: PostgreSQL integration, all E2E scenarios, outage/recovery, and test-resource cleanup |
+
+The final govulncheck run reported **0 reachable vulnerabilities**; it also reported informational findings in unused package/module code. This matches the documented reachability-based gate and does not claim that every transitive dependency is advisory-free.
+
+The updated workflow and Dependabot configuration have not been executed remotely in this work session. No branch-protection settings were changed.
