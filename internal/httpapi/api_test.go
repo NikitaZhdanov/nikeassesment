@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -162,6 +164,186 @@ func TestInvalidWrites(t *testing.T) {
 	}
 }
 
+func TestStrictProductJSON(t *testing.T) {
+	type testCase struct{ name, body string }
+	tests := []testCase{
+		{"scalar", `true`},
+		{"UTF-8 in property", strings.Replace(validJSON, `"name"`, "\"na\xffme\"", 1)},
+		{"UTF-8 after object", validJSON + "\xff"},
+		{"UTF-8 before object", "\xff" + validJSON},
+		{"missing colon", `{"sku" "SHOE-01"}`},
+		{"missing closing brace", strings.TrimSuffix(validJSON, "}")},
+		{"trailing comma", strings.TrimSuffix(validJSON, "}") + ",}"},
+		{"wrong closing delimiter", strings.TrimSuffix(validJSON, "}") + "]"},
+		{"wrong value type", strings.Replace(validJSON, `"Shoe"`, `{}`, 1)},
+		{"nested unknown object", strings.TrimSuffix(validJSON, "}") + `,"extra":{"name":"value"}}`},
+		{"trailing null", validJSON + ` null`},
+		{"trailing array", validJSON + ` []`},
+		{"escaped duplicate", strings.TrimSuffix(validJSON, "}") + `,"\u0073ku":"SHOE-02"}`},
+	}
+	for _, field := range []string{"sku", "name", "description", "category", "price_cents"} {
+		key := `"` + field + `"`
+		for _, variant := range []string{strings.ToUpper(field), strings.ToUpper(field[:1]) + field[1:]} {
+			tests = append(tests, testCase{"case " + variant, strings.Replace(validJSON, key, `"`+variant+`"`, 1)})
+			for _, prefix := range []bool{false, true} {
+				member := `"` + variant + `":null,`
+				body := "{" + member + validJSON[1:]
+				if !prefix {
+					body = strings.TrimSuffix(validJSON, "}") + "," + strings.TrimSuffix(member, ",") + "}"
+				}
+				tests = append(tests, testCase{fmt.Sprintf("mixed %s prefix=%t", variant, prefix), body})
+			}
+		}
+		for _, value := range []string{`null`, `"different"`} {
+			tests = append(tests, testCase{"duplicate " + field + " " + value, strings.TrimSuffix(validJSON, "}") + "," + key + ":" + value + "}"})
+		}
+		// Include identical repeated members as well as conflicting duplicates.
+		var members map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal([]byte(validJSON), &members))
+		tests = append(tests, testCase{"identical duplicate " + field, "{" + key + ":" + string(members[field]) + "," + validJSON[1:]})
+		if field != "description" {
+			for _, missing := range []bool{false, true} {
+				members[field] = json.RawMessage("null")
+				if missing {
+					delete(members, field)
+				}
+				body, err := json.Marshal(members)
+				require.NoError(t, err)
+				tests = append(tests, testCase{fmt.Sprintf("required %s missing=%t", field, missing), string(body)})
+			}
+		}
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, method := range []string{"POST", "PUT"} {
+				s := &stubRepo{}
+				path := "/v1/products"
+				if method == "PUT" {
+					path += "/" + uuid.NewString()
+				}
+				assertError(t, request(handler(s, nil), method, path, tc.body, "application/json"), 400, "validation_error")
+				require.Zero(t, s.calls)
+			}
+		})
+	}
+}
+
+func TestProductEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		valid       bool
+	}{
+		{"multibyte", "  Café 靴 👟\t ", true},
+		{"replacement character", "\ufffd", true},
+		{"escaped Unicode", `\u00e9\u9774\ud83d\udc5f`, true},
+		{"escaped backslash is not NUL", `\\u0000`, true},
+		{"invalid byte", "\xff", false},
+		{"continuation byte", "\x80", false},
+		{"truncated sequence", "\xe2\x82", false},
+		{"overlong sequence", "\xc0\xaf", false},
+		{"UTF-8 surrogate", "\xed\xa0\x80", false},
+		{"above Unicode range", "\xf4\x90\x80\x80", false},
+		{"raw NUL", "\x00", false},
+		{"escaped NUL", `\u0000`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, field := range []string{"name", "description"} {
+				for _, method := range []string{"POST", "PUT"} {
+					// Raw bytes are intentional: json.Marshal would repair malformed UTF-8.
+					value := tc.value
+					if tc.name == "multibyte" {
+						encoded, err := json.Marshal(value)
+						require.NoError(t, err)
+						value = string(encoded[1 : len(encoded)-1])
+					}
+					old := `"` + field + `":"` + map[string]string{"name": "Shoe", "description": "A shoe"}[field] + `"`
+					body := strings.Replace(validJSON, old, `"`+field+`":"`+value+`"`, 1)
+					s := &stubRepo{}
+					path, status := "/v1/products", 201
+					if method == "PUT" {
+						path, status = path+"/"+uuid.NewString(), 200
+					}
+					w := request(handler(s, nil), method, path, body, "application/json")
+					if tc.valid {
+						require.Equal(t, status, w.Code, w.Body.String())
+						var expected catalog.Input
+						require.NoError(t, json.Unmarshal([]byte(body), &expected))
+						require.Equal(t, expected, s.input)
+						if field == "name" && tc.name == "multibyte" {
+							require.Equal(t, tc.value, s.input.Name)
+						}
+					} else {
+						assertError(t, w, 400, "validation_error")
+						require.Zero(t, s.calls)
+					}
+				}
+			}
+		})
+	}
+	for _, field := range []string{"sku", "name", "description", "category"} {
+		t.Run("NUL in "+field, func(t *testing.T) {
+			var values map[string]any
+			require.NoError(t, json.Unmarshal([]byte(validJSON), &values))
+			values[field] = "before\x00after"
+			body, err := json.Marshal(values)
+			require.NoError(t, err)
+			for _, method := range []string{"POST", "PUT"} {
+				s := &stubRepo{}
+				path := "/v1/products"
+				if method == "PUT" {
+					path += "/" + uuid.NewString()
+				}
+				assertError(t, request(handler(s, nil), method, path, string(body), "application/json"), 400, "validation_error")
+				require.Zero(t, s.calls)
+			}
+		})
+	}
+}
+
+func TestValidWriteBoundaries(t *testing.T) {
+	for _, body := range []string{
+		validJSON + strings.Repeat(" ", (64<<10)-len(validJSON)),
+		strings.Replace(validJSON, `"Shoe"`, `"`+strings.Repeat("👟", 200)+`"`, 1),
+		strings.Replace(validJSON, `"A shoe"`, `"`+strings.Repeat("靴", 5000)+`"`, 1),
+		strings.Replace(validJSON, `"description":"A shoe",`, "", 1),
+		strings.Replace(validJSON, `"A shoe"`, `null`, 1),
+		strings.Replace(validJSON, `"sku"`, `"\u0073ku"`, 1),
+		strings.Replace(validJSON, `100`, `0`, 1),
+	} {
+		s := &stubRepo{}
+		w := request(handler(s, nil), "POST", "/v1/products", body, "application/json")
+		require.Equal(t, 201, w.Code, w.Body.String())
+		require.Equal(t, 1, s.calls)
+	}
+	for _, body := range []string{
+		validJSON + strings.Repeat(" ", (64<<10)-len(validJSON)+1),
+		"{" + strings.Repeat(" ", 64<<10),
+		validJSON + strings.Repeat(" ", (64<<10)-len(validJSON)) + "\xff",
+	} {
+		s := &stubRepo{}
+		assertError(t, request(handler(s, nil), "POST", "/v1/products", body, "application/json"), 413, "payload_too_large")
+		require.Zero(t, s.calls)
+	}
+}
+
+func TestFailureLogging(t *testing.T) {
+	for _, cause := range []error{errors.New("SQL bug: internal detail"), fmt.Errorf("%w: connection failed", catalog.ErrUnavailable)} {
+		var logs bytes.Buffer
+		h := New(&stubRepo{err: cause}, nil, slog.New(slog.NewJSONHandler(&logs, nil)))
+		r := httptest.NewRequest("GET", "/v1/products", nil)
+		r.Header.Set("X-Request-ID", "review-request-123")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		require.Equal(t, "review-request-123", w.Header().Get("X-Request-ID"))
+		var entry map[string]any
+		require.NoError(t, json.NewDecoder(&logs).Decode(&entry))
+		require.Equal(t, "ERROR", entry["level"])
+		require.Equal(t, "review-request-123", entry["request_id"])
+		require.Equal(t, cause.Error(), entry["error"])
+		require.NotContains(t, w.Body.String(), cause.Error())
+	}
+}
+
 func TestErrorsAndBadIDs(t *testing.T) {
 	for _, method := range []string{"GET", "PUT", "DELETE"} {
 		s := &stubRepo{}
@@ -174,7 +356,11 @@ func TestErrorsAndBadIDs(t *testing.T) {
 		status int
 		code   string
 	}{
-		{catalog.ErrNotFound, 404, "not_found"}, {catalog.ErrConflict, 409, "conflict"}, {errors.New("secret SQL password"), 503, "unavailable"},
+		{catalog.ErrNotFound, 404, "not_found"},
+		{catalog.ErrConflict, 409, "conflict"},
+		{errors.New("secret SQL password"), 500, "internal_error"},
+		{fmt.Errorf("secret database URL: %w", catalog.ErrUnavailable), 503, "unavailable"},
+		{fmt.Errorf("secret constraint: %w", catalog.ErrInvalidInput), 400, "validation_error"},
 	} {
 		for _, method := range []string{"POST", "GET", "PUT", "DELETE"} {
 			path := "/v1/products"
@@ -185,6 +371,9 @@ func TestErrorsAndBadIDs(t *testing.T) {
 			assertError(t, w, tc.status, tc.code)
 			require.NotContains(t, w.Body.String(), "secret")
 		}
+		w := request(handler(&stubRepo{err: tc.err}, nil), "GET", "/v1/products", "", "")
+		assertError(t, w, tc.status, tc.code)
+		require.NotContains(t, w.Body.String(), "secret")
 	}
 }
 
@@ -203,7 +392,7 @@ func TestList(t *testing.T) {
 	require.JSONEq(t, `{"items":[],"next_cursor":null}`, w.Body.String())
 	w = request(handler(&stubRepo{}, nil), "GET", "/v1/products?limit=0", "", "")
 	assertError(t, w, 400, "validation_error")
-	w = request(handler(&stubRepo{err: errors.New("offline")}, nil), "GET", "/v1/products", "", "")
+	w = request(handler(&stubRepo{err: catalog.ErrUnavailable}, nil), "GET", "/v1/products", "", "")
 	assertError(t, w, 503, "unavailable")
 }
 

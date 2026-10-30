@@ -15,6 +15,8 @@ const MaxPrice int64 = 1_000_000_000_000
 var (
 	ErrNotFound     = errors.New("product not found")
 	ErrConflict     = errors.New("SKU already exists")
+	ErrInvalidInput = errors.New("invalid product input")
+	ErrUnavailable  = errors.New("database unavailable")
 	validate        = validator.New(validator.WithRequiredStructEnabled())
 	skuPattern      = regexp.MustCompile(`^[A-Z0-9][A-Z0-9_-]{0,63}$`)
 	categoryPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -42,6 +44,11 @@ type Input struct {
 }
 
 func (in Input) Validate() error {
+	for _, value := range []string{in.SKU, in.Name, in.Description, in.Category} {
+		if strings.ContainsRune(value, '\x00') {
+			return ErrInvalidInput
+		}
+	}
 	if err := validate.Struct(in); err != nil {
 		return errors.New("required fields or field limits are invalid")
 	}

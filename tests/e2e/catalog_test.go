@@ -204,6 +204,63 @@ func TestUC02UniqueSKU(t *testing.T) {
 	}
 }
 
+func TestUC01StrictJSONAndEncoding(t *testing.T) {
+	only(t, "normal")
+	original := create(t, "strict-original", 123)
+	valid, err := json.Marshal(payload("strict-rejected", 10))
+	require.NoError(t, err)
+	tests := []struct{ name, body string }{
+		{"malformed UTF-8", strings.Replace(string(valid), "Running shoe", "shoe\xff", 1)},
+		{"overlong UTF-8", strings.Replace(string(valid), "Running shoe", "\xc0\xaf", 1)},
+		{"truncated UTF-8", strings.Replace(string(valid), "Running shoe", "\xf0\x9f", 1)},
+	}
+	for _, field := range []string{"sku", "name", "description", "category", "price_cents"} {
+		key := `"` + field + `"`
+		for _, variant := range []string{strings.ToUpper(field), strings.ToUpper(field[:1]) + field[1:]} {
+			tests = append(tests, struct{ name, body string }{"case " + variant, strings.Replace(string(valid), key, `"`+variant+`"`, 1)})
+			tests = append(tests, struct{ name, body string }{"mixed case " + variant, "{" + `"` + variant + `":null,` + string(valid[1:])})
+		}
+		var members map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(valid, &members))
+		tests = append(tests, struct{ name, body string }{"duplicate " + field, "{" + key + ":" + string(members[field]) + "," + string(valid[1:])})
+		if field != "price_cents" {
+			members[field] = json.RawMessage(`"before\u0000after"`)
+			body, err := json.Marshal(members)
+			require.NoError(t, err)
+			tests = append(tests, struct{ name, body string }{"NUL " + field, string(body)})
+		}
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, method := range []string{"POST", "PUT"} {
+				path := "/v1/products"
+				if method == "PUT" {
+					path += "/" + original.ID
+				}
+				assertError(t, call(t, method, path, []byte(tc.body), "application/json"), 400, "validation_error")
+			}
+		})
+	}
+	got := read[product](t, call(t, "GET", "/v1/products/"+original.ID, nil, ""), 200)
+	require.Equal(t, original, got)
+	rejected := read[page](t, call(t, "GET", "/v1/products?category=strict-rejected", nil, ""), 200)
+	require.Empty(t, rejected.Items)
+
+	// Exercise valid escaped Unicode and surrounding whitespace through storage.
+	in := payload("unicode-case", 0)
+	in["name"] = "  Café 靴 👟\t "
+	in["description"] = strings.Repeat("靴", 5000)
+	body, err := json.Marshal(in)
+	require.NoError(t, err)
+	body = bytes.ReplaceAll(body, []byte("👟"), []byte(`\ud83d\udc5f`))
+	p := read[product](t, call(t, "POST", "/v1/products", body, "application/json"), 201)
+	t.Cleanup(func() { call(t, "DELETE", "/v1/products/"+p.ID, nil, "") })
+	require.Equal(t, in["name"], p.Name)
+	require.Equal(t, in["description"], p.Description)
+	got = read[product](t, call(t, "GET", "/v1/products/"+p.ID, nil, ""), 200)
+	require.Equal(t, p, got)
+}
+
 func TestUC03ReplaceProduct(t *testing.T) {
 	only(t, "normal")
 	p := create(t, "before-update", 100)
@@ -242,6 +299,51 @@ func TestUC04DeleteProduct(t *testing.T) {
 	require.Empty(t, listed.Items)
 	require.NotNil(t, listed.Items)
 	require.Nil(t, listed.Next)
+}
+
+func TestUC03ConcurrentFullReplacement(t *testing.T) {
+	only(t, "normal")
+	original := create(t, "concurrent-original", 1)
+	path := "/v1/products/" + original.ID
+	updates := make([]product, 4)
+	t.Run("concurrent PUTs", func(t *testing.T) {
+		for i := range updates {
+			t.Run(fmt.Sprint(i), func(t *testing.T) {
+				t.Parallel()
+				in := payload(fmt.Sprintf("concurrent-%d", i), int64(100+i))
+				in["name"] = fmt.Sprintf("Replacement %d", i)
+				in["description"] = fmt.Sprintf("Description %d", i)
+				if i == 0 {
+					delete(in, "description")
+				}
+				p := read[product](t, write(t, "PUT", path, in), 200)
+				require.Equal(t, original.ID, p.ID)
+				require.Equal(t, original.CreatedAt, p.CreatedAt)
+				require.True(t, p.UpdatedAt.After(original.UpdatedAt))
+				require.Equal(t, in["sku"], p.SKU)
+				require.Equal(t, in["name"], p.Name)
+				require.Equal(t, in["category"], p.Category)
+				require.Equal(t, in["price_cents"], p.Price)
+				if i == 0 {
+					require.Empty(t, p.Description)
+				} else {
+					require.Equal(t, in["description"], p.Description)
+				}
+				updates[i] = p
+			})
+		}
+	})
+	final := read[product](t, call(t, "GET", path, nil, ""), 200)
+	require.Contains(t, updates, final, "the final product must be one complete replacement")
+	for _, p := range updates {
+		require.False(t, final.UpdatedAt.Before(p.UpdatedAt))
+	}
+	other := create(t, "concurrent-unique", 2)
+	in := payload("concurrent-conflict", 3)
+	in["sku"] = final.SKU
+	assertError(t, write(t, "PUT", "/v1/products/"+other.ID, in), 409, "conflict")
+	require.Equal(t, other, read[product](t, call(t, "GET", "/v1/products/"+other.ID, nil, ""), 200))
+	require.Equal(t, final, read[product](t, call(t, "GET", path, nil, ""), 200))
 }
 
 func TestUC05BrowseFilterPaginate(t *testing.T) {

@@ -64,21 +64,34 @@ Fetching one extra row detects continuation without COUNT(*). A cursor is bounde
 
 Keyset pagination avoids work proportional to the page offset. Ordering includes UUID to break equal-price ties. Across separate requests, PostgreSQL READ COMMITTED yields live pages, not a fixed snapshot; mutable sort keys may move products past/before the cursor. No snapshot guarantee is advertised.
 
-Writes are single atomic SQL statements with RETURNING. Unique-violation code 23505 maps to conflict; no-row results map to not found. Other database failures return a generic service-unavailable response and are logged internally. PUT uses last committed write wins, explicitly accepting lost updates; version/If-Match checks are a future requirement if concurrent editing needs protection. POST is not an idempotent operation; callers can resolve uncertain outcomes via SKU conflict/listing.
+Writes are single atomic SQL statements with RETURNING. No-row results map to not found. Unique-violation code 23505 on `products_sku_key` maps to conflict; other unique violations remain internal failures. Violations of the five known product field CHECK constraints map to invalid input; unexpected constraints, NOT NULL violations, SQL syntax/schema errors, authentication/configuration errors reported by PostgreSQL, protocol errors and scan/driver bugs remain internal failures. The repository classifies every result path, including DELETE, initial list queries, row scans and terminal iteration errors, and wraps domain sentinels while retaining the underlying cause. PUT uses last committed write wins, explicitly accepting lost updates; version/If-Match checks are a future requirement if concurrent editing needs protection. The SQL row lock serializes replacements; timestamps advance by at least one microsecond relative to the preceding row version, even when the wall clock has not advanced. POST is not an idempotent operation; callers can resolve uncertain outcomes via SKU conflict/listing.
+
+Persistence failures use these HTTP mappings:
+
+| Condition | Status / code |
+| --- | --- |
+| Product not found | 404 / `not_found` |
+| Duplicate SKU | 409 / `conflict` |
+| Invalid client input, including known field CHECK violations | 400 / `validation_error` |
+| Connection failures, network errors/EOF, database-operation deadlines/cancellation | 503 / `unavailable` |
+| PostgreSQL connection exceptions (08000/08001/08003/08004/08006/08007), too many connections (53300), shutdown/recovery (57P01/57P02/57P03), query cancellation (57014), lock timeout/unavailability (55P03) | 503 / `unavailable` |
+| Unexpected SQL, constraints, protocol (08P01), or internal persistence failures | 500 / `internal_error` |
+
+Classification uses typed errors/SQLSTATEs, never error-message matching. Column scan/conversion errors remain internal even if their codec cause is EOF or a timeout. Otherwise a SQLSTATE takes precedence over a connection wrapper so server-reported SQL/authentication bugs do not become transient failures. No retries are introduced: a connection loss during a write can have an uncertain commit outcome. HTTP 500/503 responses contain only stable generic messages; logs retain the actual cause and request ID. Readiness is an availability probe and returns 503 on any failed ping.
 
 ## HTTP contract
 
 | Route | Success | Expected errors |
 | --- | --- | --- |
-| POST /v1/products | 201 + product + Location | 400, 409, 413, 415, 503 |
-| GET /v1/products/{id} | 200 + product | 400, 404, 503 |
-| PUT /v1/products/{id} | 200 + product | 400, 404, 409, 413, 415, 503 |
-| DELETE /v1/products/{id} | 204 | 400, 404, 503 |
-| GET /v1/products | 200 + `{items: [], next_cursor: null}` | 400, 503 |
+| POST /v1/products | 201 + product + Location | 400, 409, 413, 415, 500, 503 |
+| GET /v1/products/{id} | 200 + product | 400, 404, 500, 503 |
+| PUT /v1/products/{id} | 200 + product | 400, 404, 409, 413, 415, 500, 503 |
+| DELETE /v1/products/{id} | 204 | 400, 404, 500, 503 |
+| GET /v1/products | 200 + `{items: [], next_cursor: null}` | 400, 500, 503 |
 | GET /healthz | 200 | — |
 | GET /readyz | 200 | 503 |
 
-Errors are `{ "error": { "code": "validation_error", "message": "..." } }`. Other codes: `not_found`, `conflict`, `unsupported_media_type`, `payload_too_large`, `method_not_allowed`, `unavailable`, `internal_error`. All responses carry `X-Request-ID`. Unknown routes/methods use the same JSON error envelope; 405 includes an Allow header derived from registered routes. No PATCH is supported. `application/json` with charset parameters is accepted. JSON bodies must be objects and contain exactly one value. Query parsing rejects repeated/unknown keys and invalid URL encoding.
+Errors are `{ "error": { "code": "validation_error", "message": "..." } }`. Other codes: `not_found`, `conflict`, `unsupported_media_type`, `payload_too_large`, `method_not_allowed`, `unavailable`, `internal_error`. All responses carry `X-Request-ID`. Unknown routes/methods use the same JSON error envelope; 405 includes an Allow header derived from registered routes. No PATCH is supported. `application/json` with charset parameters is accepted. JSON bodies must be objects and contain exactly one value. Read at most 64 KiB plus the size-limit check through MaxBytesReader, including trailing whitespace, then validate UTF-8 before decoding. A standard-library token decoder accepts only the five exact writable property names and removes each accepted key from its lookup table to reject duplicates. Unicode-escaped property names are compared after unescaping. Values retain existing encoding/json types and required/optional semantics, including omitted/null description becoming empty. Domain validation rejects NUL in every writable string. Valid multibyte characters, Unicode escapes (including surrogate pairs), literal replacement characters and surrounding name whitespace are preserved. Query parsing rejects repeated/unknown keys and invalid URL encoding.
 
 ## Reliability and operations
 
@@ -92,7 +105,7 @@ Initially read from the primary; add replicas only if measured need justifies ex
 
 Unit tests use table-driven validator/cursor cases, httptest with a mocked repository, and pgxmock for SQL results/errors. `make coverage` measures every production package via `-coverpkg=./...`, includes untested files, runs the race detector, and enforces a statement-weighted >=90% threshold using the Go coverage profile. A small script checks raw counts rather than rounded display percentages.
 
-Integration tests run only with the `integration` build tag and a required TEST_DATABASE_URL. They use real PostgreSQL after migrations; transactions isolate most fixtures; concurrent uniqueness uses independent connections and explicit cleanup. Verify constraints, persistence, update invariants, ordering, inclusive filters, and no skipped ties.
+Integration tests run only with the `integration` build tag and a required TEST_DATABASE_URL. They use real PostgreSQL after migrations; transactions isolate most fixtures; concurrent uniqueness and replacement tests use independent connections and explicit cleanup. The replacement test observes pg_blocking_pids before releasing the first transaction, then checks visibility before/after each commit and strict timestamp progression without sleeps or assumed goroutine ordering. Verify constraints, persistence, SQL-error classification, update invariants, ordering, inclusive filters, and no skipped ties.
 
 E2E tests run only with the `e2e` tag and required E2E_BASE_URL. Compose builds the actual binary, waits for PostgreSQL health and migration completion, then runs black-box HTTP scenarios UC-01–UC-07. The runner stops PostgreSQL for outage checks, restarts it, and verifies recovery/durability. A shell trap preserves failing exit status and cleans the isolated test project, including test volumes. CI runs unit coverage/vet, persistence integration, and E2E.
 

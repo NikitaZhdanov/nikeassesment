@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 
 	"github.com/google/uuid"
@@ -44,7 +46,7 @@ func (r *Repository) Update(ctx context.Context, id uuid.UUID, in catalog.Input)
 func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
 	tag, err := r.db.Exec(ctx, "DELETE FROM products WHERE id = $1", id.String())
 	if err != nil {
-		return err
+		return classify(err)
 	}
 	if tag.RowsAffected() == 0 {
 		return catalog.ErrNotFound
@@ -56,7 +58,7 @@ func (r *Repository) List(ctx context.Context, q catalog.Query) ([]catalog.Produ
 	sql, args := listSQL(q)
 	rows, err := r.db.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 	defer rows.Close()
 	products := make([]catalog.Product, 0, q.Limit+1)
@@ -67,21 +69,58 @@ func (r *Repository) List(ctx context.Context, q catalog.Query) ([]catalog.Produ
 		}
 		products = append(products, p)
 	}
-	return products, rows.Err()
+	return products, classify(rows.Err())
 }
 
 func scan(row pgx.Row) (catalog.Product, error) {
 	var p catalog.Product
 	err := row.Scan(&p.ID, &p.SKU, &p.Name, &p.Description, &p.Category, &p.PriceCents, &p.CreatedAt, &p.UpdatedAt)
+	p.CreatedAt, p.UpdatedAt = p.CreatedAt.UTC(), p.UpdatedAt.UTC()
+	return p, classify(err)
+}
+
+// Keep driver details inside this package while retaining the original cause
+// for structured logs. Unknown SQL/driver errors remain internal failures.
+func classify(err error) error {
+	if err == nil {
+		return nil
+	}
+	// A column conversion failure is internal even when a codec wraps EOF or
+	// a timeout. Those causes indicate unavailability only on the transport path.
+	var scanErr pgx.ScanArgError
+	if errors.As(err, &scanErr) {
+		return err
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return p, catalog.ErrNotFound
+		return fmt.Errorf("%w: %w", catalog.ErrNotFound, err)
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return p, catalog.ErrConflict
+	if errors.As(err, &pgErr) {
+		switch {
+		case pgErr.Code == "23505" && pgErr.ConstraintName == "products_sku_key":
+			return fmt.Errorf("%w: %w", catalog.ErrConflict, err)
+		case pgErr.Code == "23514" && pgErr.TableName == "products":
+			switch pgErr.ConstraintName {
+			case "products_sku_check", "products_name_check", "products_description_check", "products_category_check", "products_price_cents_check":
+				return fmt.Errorf("%w: %w", catalog.ErrInvalidInput, err)
+			}
+		case pgErr.Code == "08000", pgErr.Code == "08001", pgErr.Code == "08003", pgErr.Code == "08004", pgErr.Code == "08006", pgErr.Code == "08007",
+			pgErr.Code == "53300", pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03",
+			pgErr.Code == "57014", pgErr.Code == "55P03":
+			return fmt.Errorf("%w: %w", catalog.ErrUnavailable, err)
+		}
+		// In particular, protocol, authentication, syntax, schema and unexpected
+		// constraint errors are not evidence of temporary unavailability.
+		return err
 	}
-	p.CreatedAt, p.UpdatedAt = p.CreatedAt.UTC(), p.UpdatedAt.UTC()
-	return p, err
+	var connectErr *pgconn.ConnectError
+	var netErr net.Error
+	if errors.As(err, &connectErr) || errors.As(err, &netErr) || pgconn.Timeout(err) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return fmt.Errorf("%w: %w", catalog.ErrUnavailable, err)
+	}
+	return err
 }
 
 func listSQL(q catalog.Query) (string, []any) {

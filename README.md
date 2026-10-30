@@ -115,7 +115,7 @@ curl --get http://localhost:8080/v1/products \
 | `GET /healthz` | 200 | Process liveness; independent of database |
 | `GET /readyz` | 200 | 503 database unavailable |
 
-JSON writes require `Content-Type: application/json` (415 otherwise) and are limited to 64 KiB (413). Unknown fields/query keys and repeated query parameters are rejected. Repository failures return 503; unexpected panics return 500. Error bodies are consistent:
+JSON writes require `Content-Type: application/json` (415 otherwise) and are limited to 64 KiB (413). JSON property names are case-sensitive; unknown properties, duplicates (including identical repeated keys), malformed UTF-8, and NUL in writable strings (including `\u0000`) return 400. Valid Unicode and surrounding name whitespace are preserved. Unknown query keys and repeated query parameters are rejected. Database connection/availability failures and operation timeouts return 503; unexpected SQL/internal persistence failures and panics return 500. Server errors use generic messages; the internal cause is logged with the request ID. Error bodies are consistent:
 
 ```json
 {"error":{"code":"not_found","message":"product not found"}}
@@ -142,7 +142,7 @@ make test-system   # integration and E2E, including database outage/recovery
 go tool cover -html=coverage.out
 ```
 
-Unit tests use testify, httptest, and pgxmock. Integration tests execute real SQL, verify up/down migrations and indexes, and exercise constraints, concurrent SKU uniqueness, CRUD, filter bounds and pagination ties. E2E tests make black-box HTTP calls against the built API image; they also verify database outage responses and persistence after recovery.
+Unit tests use testify, httptest, and pgxmock. Integration tests execute real SQL, verify up/down migrations and indexes, and exercise constraints, concurrent SKU uniqueness, controlled concurrent full replacements, persistence error classification, CRUD, filter bounds and pagination ties. E2E tests make black-box HTTP calls against the built API image; they also verify strict JSON/Unicode validation, concurrent PUTs, database outage responses and persistence after recovery.
 
 System tests use the standalone `compose.test.yaml`, a unique project name, no published ports, and a separate test volume. The runner propagates failures, prints container logs on failure, and removes test containers/volumes on exit. It does not touch the development stack. Docker must be running; tests fail if prerequisites are absent.
 

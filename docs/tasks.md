@@ -16,6 +16,7 @@ Execute in order. A task is complete only when its artifacts and specified check
 | 10 | Done | Write README and query-plan experiment | NFR-02, NFR-08 | Reproducible commands, supported versions, observed results |
 | 11 | Done | Review specs against behavior and report verification | All | Final test results and limitations below |
 | 12 | Done | Add separate CI static/security jobs, pinned Go-native scanners, weekly checks and dependency updates | NFR-09 | make static, make security, make check; workflow and Dependabot validation |
+| 13 | Done | Remediate review findings: exact/duplicate JSON keys, UTF-8/NUL validation, persistence error classification, concurrent replacement tests, and specification traceability | FR-03, FR-07–08, NFR-01, NFR-04–09, UC-01–UC-07 | Extended HTTP/domain/pgxmock unit tests, real PostgreSQL commit-order/error tests, and black-box strict-input/concurrent PUT scenarios |
 
 ## Verification record
 
@@ -64,3 +65,24 @@ The initial security scan failed as intended on known advisories in chi, pgx, x/
 The final govulncheck run reported **0 reachable vulnerabilities**; it also reported informational findings in unused package/module code. This matches the documented reachability-based gate and does not claim that every transitive dependency is advisory-free.
 
 The updated workflow and Dependabot configuration have not been executed remotely in this work session. No branch-protection settings were changed.
+
+### Review remediation verification (2026-10-30)
+
+The review fixes preserve package boundaries, explicit SQL, migrations/indexes, keyset cursor semantics, request IDs, graceful shutdown, and health probes. No dependencies or runtime infrastructure were added. Description omission/null behavior and surrounding name whitespace are unchanged.
+
+| Review finding | Implementation and verification |
+| --- | --- |
+| Case-insensitive/duplicate JSON keys | `httpapi.decodeProduct` uses standard-library object tokens and exact decoded names; POST/PUT tables reject case variants in either order, identical/conflicting duplicates, escaped-equivalent duplicates, malformed objects and multiple values. |
+| UTF-8/NUL data corruption or persistence errors | Bounded raw payloads are checked before decoding; domain validation rejects NUL in all writable strings. HTTP and E2E tests cover malformed byte sequences, escaped NUL, valid multibyte/escaped Unicode and preserved whitespace. Boundary tests cover exactly 64 KiB, one byte over, trailing whitespace and Unicode field lengths. |
+| All persistence failures incorrectly returned 503 | Repository paths preserve the original cause and classify known constraints, connectivity and timeouts. SQL/schema/protocol/authentication/scan bugs remain internal (500), including scan codecs wrapping EOF/timeouts. pgxmock tables cover all operations and list iteration; HTTP mocks verify each status and correlated internal logging; real PostgreSQL tests exercise CHECK metadata and missing-schema failures. |
+| Missing concurrent PUT evidence | A PostgreSQL test observes the blocking transaction, controls commit order, checks visibility/complete replacements, immutable fields, monotonic timestamps and failed SKU-conflict atomicity. Concurrent HTTP PUTs verify complete responses and final storage. Existing uniqueness/pagination/UC-01–UC-07 scenarios remain intact. |
+
+| Final check | Result |
+| --- | --- |
+| `make check` (Go 1.26.10) | Passed: gofmt, tagged go vet/Staticcheck, unit race tests, coverage gate/self-tests, module integrity and tagged/test-inclusive govulncheck |
+| Unit coverage | **96.01% — 313 / 326 production statements**; unit-only, all production packages included; changed HTTP/domain/repository functions have 100% statement coverage |
+| `make test-system` | Passed: real PostgreSQL integration with race detection, Compose E2E UC-01–UC-07 plus strict-input/concurrent PUT scenarios, database outage/recovery and cleanup; exit status 0 |
+| `git diff --check` and final review | Passed; changes limited to review remediation, tests and specification clarification |
+| GitHub Actions consistency | Existing static/coverage/security jobs match `make check`; system job calls `make test-system`; no workflow edits needed |
+
+The default host Go symlink is broken; verification used the already-cached Go 1.26.10 toolchain on PATH. Go cache/network and Docker socket access required sandbox approval; execution succeeded with that access. govulncheck reported **0 reachable vulnerabilities**, with informational findings in unused dependency code. GitHub Actions was inspected but not run remotely. No commit or push was created.

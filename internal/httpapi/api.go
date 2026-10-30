@@ -1,15 +1,18 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -81,7 +84,7 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 	defer cancel()
 	if err := a.ping(ctx); err != nil {
-		a.failure(w, r, err)
+		a.failure(w, r, fmt.Errorf("%w: %w", catalog.ErrUnavailable, err))
 		return
 	}
 	respond(w, 200, map[string]string{"status": "ready"})
@@ -174,15 +177,14 @@ func decode(w http.ResponseWriter, r *http.Request) (catalog.Input, bool) {
 		return in, false
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&in); err == nil {
-		// A second decode also drains trailing whitespace through the size limit.
-		var extra any
-		if err = decoder.Decode(&extra); errors.Is(err, io.EOF) {
-			err = in.Validate()
-		} else if err == nil {
-			err = errors.New("multiple JSON values")
+	// Read the entire bounded payload, including trailing whitespace, before
+	// decoding: encoding/json would silently replace malformed UTF-8.
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		if !utf8.Valid(body) {
+			err = errors.New("invalid UTF-8")
+		} else {
+			err = decodeProduct(body, &in)
 		}
 	}
 	if err != nil {
@@ -197,15 +199,62 @@ func decode(w http.ResponseWriter, r *http.Request) (catalog.Input, bool) {
 	return in, true
 }
 
+// Decode object members individually because encoding/json's struct matching
+// accepts case variants and silently overwrites duplicate keys. Decoded keys
+// also catch duplicates expressed with JSON Unicode escapes.
+func decodeProduct(body []byte, in *catalog.Input) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if start != json.Delim('{') {
+		return errors.New("product must be an object")
+	}
+	fields := map[string]any{
+		"sku": &in.SKU, "name": &in.Name, "description": &in.Description,
+		"category": &in.Category, "price_cents": &in.PriceCents,
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		field, known := fields[name]
+		if !ok || !known {
+			return errors.New("unknown or duplicate product property")
+		}
+		delete(fields, name)
+		if err := decoder.Decode(field); err != nil {
+			return err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("invalid trailing JSON or multiple values")
+	}
+	return in.Validate()
+}
+
 func (a *API) failure(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, catalog.ErrNotFound):
 		fail(w, 404, "not_found", "product not found")
 	case errors.Is(err, catalog.ErrConflict):
 		fail(w, 409, "conflict", "SKU already exists")
+	case errors.Is(err, catalog.ErrInvalidInput):
+		fail(w, 400, "validation_error", "invalid product field values")
 	default:
 		a.log.Error("repository failure", "request_id", middleware.GetReqID(r.Context()), "error", err)
-		fail(w, 503, "unavailable", "service temporarily unavailable")
+		if errors.Is(err, catalog.ErrUnavailable) {
+			fail(w, 503, "unavailable", "service temporarily unavailable")
+		} else {
+			fail(w, 500, "internal_error", "internal server error")
+		}
 	}
 }
 

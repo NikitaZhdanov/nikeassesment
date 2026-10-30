@@ -10,12 +10,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nikitazhdanov/nikeassesment/internal/catalog"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -236,4 +238,138 @@ func TestIntegrationUpdateConflict(t *testing.T) {
 	// The transaction is aborted after a constraint violation; PostgreSQL atomicity
 	// ensures the failed statement cannot partially update the other product.
 	require.NotEqual(t, p.ID, other.ID)
+}
+
+func TestIntegrationConcurrentFullReplacement(t *testing.T) {
+	pool := integrationPool(t)
+	r := New(pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	originalInput := input(fixture())
+	originalInput.SKU = strings.ToUpper(uuid.NewString())
+	original, err := r.Create(ctx, originalInput)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := pool.Exec(context.Background(), "DELETE FROM products WHERE id=$1", original.ID.String())
+		require.NoError(t, err)
+	})
+
+	first, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = first.Rollback(context.Background()) }()
+	second, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = second.Rollback(context.Background()) }()
+	var firstPID, secondPID int32
+	require.NoError(t, first.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&firstPID))
+	require.NoError(t, second.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&secondPID))
+
+	priceA, priceB := int64(123), int64(987)
+	inputA := catalog.Input{SKU: strings.ToUpper(uuid.NewString()), Name: "First replacement", Description: "First description", Category: "first-category", PriceCents: &priceA}
+	inputB := catalog.Input{SKU: strings.ToUpper(uuid.NewString()), Name: "Second replacement", Description: "", Category: "second-category", PriceCents: &priceB}
+	writtenA, err := New(first).Update(ctx, original.ID, inputA)
+	require.NoError(t, err)
+	type outcome struct {
+		product catalog.Product
+		err     error
+	}
+	result := make(chan outcome, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		p, err := New(second).Update(ctx, original.ID, inputB)
+		result <- outcome{p, err}
+	}()
+	defer func() {
+		cancel()
+		<-finished // Stop using second before its deferred rollback, even on failure.
+	}()
+	// Observe PostgreSQL's lock graph, rather than sleeping or assuming the
+	// goroutine has started. The second update must overlap and wait for first.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		var blocked bool
+		err := pool.QueryRow(ctx, "SELECT $1::integer = ANY(pg_blocking_pids($2::integer))", firstPID, secondPID).Scan(&blocked)
+		require.NoError(c, err)
+		require.True(c, blocked)
+	}, 5*time.Second, 10*time.Millisecond)
+	visible, err := r.Get(ctx, original.ID)
+	require.NoError(t, err)
+	require.Equal(t, original, visible, "uncommitted replacements are invisible")
+	require.NoError(t, first.Commit(ctx))
+
+	var writtenB catalog.Product
+	select {
+	case got := <-result:
+		require.NoError(t, got.err)
+		writtenB = got.product
+	case <-ctx.Done():
+		t.Fatal("second replacement did not complete:", ctx.Err())
+	}
+	visible, err = r.Get(ctx, original.ID)
+	require.NoError(t, err)
+	require.Equal(t, writtenA, visible, "only the first replacement has committed")
+	require.NoError(t, second.Commit(ctx))
+	// Another connection observes exactly the last committed replacement.
+	final, err := New(integrationPool(t)).Get(ctx, original.ID)
+	require.NoError(t, err)
+	require.Equal(t, writtenB, final)
+	require.Equal(t, inputA, input(writtenA))
+	require.Equal(t, inputB, input(writtenB))
+	for _, p := range []catalog.Product{writtenA, writtenB, final} {
+		require.Equal(t, original.ID, p.ID)
+		require.Equal(t, original.CreatedAt, p.CreatedAt)
+		require.True(t, p.UpdatedAt.After(original.UpdatedAt))
+	}
+	require.True(t, writtenB.UpdatedAt.After(writtenA.UpdatedAt))
+
+	// A conflicting replacement remains atomic and cannot steal the winner's SKU.
+	otherInput := originalInput
+	other, err := r.Create(ctx, otherInput)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := pool.Exec(context.Background(), "DELETE FROM products WHERE id=$1", other.ID.String())
+		require.NoError(t, err)
+	})
+	_, err = r.Update(ctx, other.ID, inputB)
+	require.ErrorIs(t, err, catalog.ErrConflict)
+	unchanged, err := r.Get(ctx, other.ID)
+	require.NoError(t, err)
+	require.Equal(t, other, unchanged)
+	final, err = r.Get(ctx, original.ID)
+	require.NoError(t, err)
+	require.Equal(t, writtenB, final)
+}
+
+func TestIntegrationPersistenceErrorClassification(t *testing.T) {
+	// A real server error verifies both SQLSTATE/constraint metadata and cause
+	// preservation. Each transaction is isolated because a SQL error aborts it.
+	for _, tc := range []struct {
+		name  string
+		setup string
+		want  error
+	}{
+		{"invalid input", "", catalog.ErrInvalidInput},
+		{"unexpected schema failure", "SET LOCAL search_path TO pg_catalog", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := integrationTx(t)
+			ctx := context.Background()
+			if tc.setup != "" {
+				_, err := tx.Exec(ctx, tc.setup)
+				require.NoError(t, err)
+			}
+			in := input(fixture())
+			in.Name = ""
+			_, err := New(tx).Create(ctx, in)
+			var cause *pgconn.PgError
+			require.ErrorAs(t, err, &cause)
+			require.NotErrorIs(t, err, catalog.ErrUnavailable)
+			if tc.want != nil {
+				require.ErrorIs(t, err, tc.want)
+			} else {
+				require.Equal(t, "42P01", cause.Code)
+				require.NotErrorIs(t, err, catalog.ErrInvalidInput)
+			}
+		})
+	}
 }

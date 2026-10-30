@@ -10,7 +10,7 @@ Actor: catalog maintainer. Preconditions: API and database ready.
 2. Receive 201, Location `/v1/products/{id}`, generated UUID, and timestamps.
 3. GET Location; receive 200 with the same persisted values.
 
-Alternatives: missing/null required fields, bad SKU/category, blank name, negative/fractional/oversized price, malformed JSON, unknown fields, trailing JSON, or an overlong field return 400. Wrong media type returns 415; a body over 64 KiB returns 413. Invalid writes do not create products. Covers FR-01, FR-02, FR-07, NFR-01, NFR-07.
+Alternatives: missing/null required fields, bad SKU/category, blank name, negative/fractional/oversized price, malformed JSON, unknown fields (including incorrect capitalization), duplicate properties (even identical keys or escaped equivalents), malformed UTF-8, NUL in any writable string (including escaped `\u0000`), trailing JSON, or an overlong field return 400. Wrong media type returns 415; a body over 64 KiB returns 413. Invalid writes do not create products. Valid multibyte/escaped Unicode and surrounding name whitespace survive creation and retrieval unchanged. Omitted/null description remains an empty string. Covers FR-01, FR-02, FR-07, NFR-01, NFR-07.
 
 ## UC-02 — Enforce unique SKUs
 
@@ -30,7 +30,7 @@ Actor: catalog maintainer. Preconditions: a product exists.
 2. Receive 200; ID/created_at are unchanged and updated_at advances.
 3. GET confirms the replacement. Listing in the new category includes it and the old category excludes it.
 
-Alternatives: incomplete replacement returns 400; valid replacement of a missing ID returns 404; malformed ID returns 400. The original product survives invalid updates. Covers FR-03, FR-07.
+Alternatives: incomplete replacement returns 400; valid replacement of a missing ID returns 404; malformed ID returns 400. The original product survives invalid updates, including strict JSON/encoding failures. Concurrent PUTs each return one complete replacement; final storage contains the last committed replacement, with ID/created_at preserved and updated_at strictly advancing. A persistence test controls commit order using PostgreSQL row locks; concurrent HTTP requests verify the same contract end to end. SKU conflicts still return 409 and leave both products unchanged. Covers FR-03, FR-07, FR-08.
 
 ## UC-04 — Delete a product
 
@@ -61,7 +61,7 @@ Actor: any API client.
 3. Call an unknown route; receive JSON 404. Use an unsupported method on a known route; receive JSON 405 with an Allow header listing supported methods.
 4. Check errors have `error.code`, `error.message`, and a request ID header, without database details.
 
-Covers FR-02 through FR-04, FR-07, NFR-07.
+Persistence failure alternatives: unexpected SQL/schema/driver failures return generic 500 `internal_error`; database connection failures and operation timeouts return generic 503 `unavailable`. Unit tests exercise each mapping and verify that the actual cause is logged with the response request ID, without exposing internal details in HTTP. Covers FR-02 through FR-04, FR-07, NFR-07.
 
 ## UC-07 — Probe service health
 
