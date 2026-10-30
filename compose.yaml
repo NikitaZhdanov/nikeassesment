@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17.6-bookworm
+    image: postgres:18.4-bookworm
     environment:
       POSTGRES_DB: catalog
       POSTGRES_USER: catalog
@@ -15,7 +15,7 @@ services:
       timeout: 3s
       retries: 30
   migrate:
-    image: migrate/migrate:v4.18.3
+    image: migrate/migrate:v4.20.1
     volumes:
       - ./migrations:/migrations:ro
     command: ["-path", "/migrations", "-database", "postgres://catalog:catalog@postgres:5432/catalog?sslmode=disable", "up"]
